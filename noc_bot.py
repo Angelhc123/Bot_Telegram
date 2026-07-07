@@ -42,8 +42,14 @@ class ServerConfig:
     password: str  # autenticación por password (no llave SSH)
 
 
-def _load_server(prefix: str) -> ServerConfig:
-    """Carga la config de un servidor a partir de variables SERVER1_*, SERVER2_*, etc."""
+def _load_server(prefix: str) -> ServerConfig | None:
+    """Carga la config de un servidor a partir de variables SERVER1_*, SERVER2_*, etc.
+    Si faltan variables obligatorias (NAME, HOST, USER, PASSWORD), devuelve None
+    en vez de tumbar el bot, para poder arrancar aunque falte un servidor."""
+    required = [f"{prefix}_NAME", f"{prefix}_HOST", f"{prefix}_USER", f"{prefix}_PASSWORD"]
+    if not all(os.getenv(k) for k in required):
+        log.warning(f"{prefix} no está configurado (faltan variables) — se omite.")
+        return None
     return ServerConfig(
         name=os.environ[f"{prefix}_NAME"],
         host=os.environ[f"{prefix}_HOST"],
@@ -53,7 +59,10 @@ def _load_server(prefix: str) -> ServerConfig:
     )
 
 
-SERVERS = [_load_server("SERVER1"), _load_server("SERVER2")]
+SERVERS = [s for s in (_load_server("SERVER1"), _load_server("SERVER2")) if s is not None]
+
+if not SERVERS:
+    log.warning("Ningún servidor configurado. El bot arrancará pero no podrá reportar nada.")
 
 SERVICES_TO_WATCH = {
     "apache2": os.getenv("SERVICE_APACHE", "apache2"),
@@ -97,6 +106,8 @@ def format_multi(title: str, results: dict) -> str:
         out = results.get(server.name, "(sin datos)")
         lines.append(f"🖥️ *{server.name}* ({server.host})")
         lines.append(f"```\n{out}\n```")
+    if len(SERVERS) < 2:
+        lines.append("⚠️ _Solo hay 1 servidor configurado. Falta agregar el segundo (SERVER2_*) en las variables de entorno._")
     return "\n".join(lines)
 
 
@@ -169,6 +180,13 @@ async def cmd_getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Chat ID: `{update.effective_chat.id}`", parse_mode="Markdown")
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Captura cualquier error no previsto en un comando/mensaje.
+    Así, si algo falla procesando UN mensaje, el bot sigue vivo y
+    puede seguir respondiendo a los siguientes mensajes normalmente."""
+    log.error(f"Error no manejado: {context.error}")
+
+
 # ------------------------------------------------------------------
 # MONITOREO AUTOMÁTICO DE CAÍDAS
 # ------------------------------------------------------------------
@@ -179,37 +197,43 @@ async def monitor_loop(app: Application):
     global _last_state
     await asyncio.sleep(5)
     while True:
-        for service_key, service_name in SERVICES_TO_WATCH.items():
-            results = await run_on_all(f"systemctl is-active {service_name} 2>/dev/null || echo inactive")
-            for server in SERVERS:
-                key = (server.name, service_name)
-                current = results.get(server.name, "unknown").strip()
-                previous = _last_state.get(key)
+        try:
+            for service_key, service_name in SERVICES_TO_WATCH.items():
+                results = await run_on_all(f"systemctl is-active {service_name} 2>/dev/null || echo inactive")
+                for server in SERVERS:
+                    key = (server.name, service_name)
+                    current = results.get(server.name, "unknown").strip()
+                    previous = _last_state.get(key)
 
-                if previous is not None and previous == "active" and current != "active":
-                    msg = (
-                        f"🚨 *ALERTA: servicio caído*\n"
-                        f"🖥️ Servidor: *{server.name}* ({server.host})\n"
-                        f"⚙️ Servicio: `{service_name}`\n"
-                        f"Estado actual: `{current}`"
-                    )
-                    try:
-                        await app.bot.send_message(chat_id=GROUP_CHAT_ID, text=msg, parse_mode="Markdown")
-                    except Exception as e:
-                        log.error(f"No se pudo enviar alerta: {e}")
+                    if previous is not None and previous == "active" and current != "active":
+                        msg = (
+                            f"🚨 *ALERTA: servicio caído*\n"
+                            f"🖥️ Servidor: *{server.name}* ({server.host})\n"
+                            f"⚙️ Servicio: `{service_name}`\n"
+                            f"Estado actual: `{current}`"
+                        )
+                        try:
+                            await app.bot.send_message(chat_id=GROUP_CHAT_ID, text=msg, parse_mode="Markdown")
+                        except Exception as e:
+                            log.error(f"No se pudo enviar alerta: {e}")
 
-                if previous is not None and previous != "active" and current == "active":
-                    msg = (
-                        f"✅ *Servicio recuperado*\n"
-                        f"🖥️ Servidor: *{server.name}* ({server.host})\n"
-                        f"⚙️ Servicio: `{service_name}` está `active` de nuevo"
-                    )
-                    try:
-                        await app.bot.send_message(chat_id=GROUP_CHAT_ID, text=msg, parse_mode="Markdown")
-                    except Exception as e:
-                        log.error(f"No se pudo enviar alerta: {e}")
+                    if previous is not None and previous != "active" and current == "active":
+                        msg = (
+                            f"✅ *Servicio recuperado*\n"
+                            f"🖥️ Servidor: *{server.name}* ({server.host})\n"
+                            f"⚙️ Servicio: `{service_name}` está `active` de nuevo"
+                        )
+                        try:
+                            await app.bot.send_message(chat_id=GROUP_CHAT_ID, text=msg, parse_mode="Markdown")
+                        except Exception as e:
+                            log.error(f"No se pudo enviar alerta: {e}")
 
-                _last_state[key] = current
+                    _last_state[key] = current
+        except Exception as e:
+            # Protección general: pase lo que pase en una vuelta del ciclo
+            # (servidor borrado, timeout raro, error de formato, etc.),
+            # el monitoreo NUNCA debe detenerse por completo.
+            log.error(f"Error en monitor_loop (se ignora y se reintenta): {e}")
 
         await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
@@ -227,6 +251,7 @@ def main():
 
     app.add_handler(CommandHandler("getid", cmd_getid))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
+    app.add_error_handler(error_handler)
 
     log.info("Bot iniciado. Esperando mensajes...")
     app.run_polling()
