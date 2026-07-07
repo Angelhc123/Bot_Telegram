@@ -17,7 +17,14 @@ from dataclasses import dataclass
 import asyncssh
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ChatMemberHandler,
+    ContextTypes,
+    filters,
+)
 
 load_dotenv()  # en local lee el archivo .env; en Railway las variables ya están inyectadas
 
@@ -154,8 +161,42 @@ async def cmd_ver_cpu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ------------------------------------------------------------------
-# ROUTER DE TEXTO
+# TEXTO DE AYUDA / LISTA DE COMANDOS
 # ------------------------------------------------------------------
+
+def help_text(mention: str = "") -> str:
+    saludo = f"👋 ¡Bienvenido/a {mention}!\n\n" if mention else ""
+    return (
+        f"{saludo}"
+        "🤖 *Bot NOC — Monitoreo y comandos remotos*\n\n"
+        "Puedes escribir estos comandos tal cual, en minúsculas:\n\n"
+        "*Estado de servicios:*\n"
+        "• `estado servicio apache2`\n"
+        "• `estado servicio mysql`\n"
+        "• `estado servicio ftp`\n\n"
+        "*Recursos del servidor:*\n"
+        "• `ver espacio` — espacio en disco\n"
+        "• `ver memoria` — uso de RAM\n"
+        "• `ver usuario` — usuarios conectados\n"
+        "• `ver cpu` — uso de CPU\n\n"
+        "Todas las respuestas incluyen datos de *ambos* servidores.\n"
+        "El bot también avisa automáticamente si algún servicio se cae o se recupera.\n\n"
+        "Escribe `info` en cualquier momento para volver a ver esta lista."
+    )
+
+
+async def cmd_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(help_text(), parse_mode="Markdown")
+
+
+async def on_new_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Se dispara cuando alguien nuevo entra al grupo (o el bot mismo es agregado)."""
+    for member in update.message.new_chat_members:
+        if member.is_bot:
+            continue  # no saludar si el que entra es otro bot
+        mention = member.first_name or "nuevo miembro"
+        await update.message.reply_text(help_text(mention=mention), parse_mode="Markdown")
+
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip().lower()
@@ -174,6 +215,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_ver_usuario(update, context)
     elif text == "ver cpu":
         await cmd_ver_cpu(update, context)
+    elif text == "info":
+        await cmd_info(update, context)
 
 
 async def cmd_getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -250,6 +293,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("getid", cmd_getid))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_chat_member))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_error_handler(error_handler)
 
