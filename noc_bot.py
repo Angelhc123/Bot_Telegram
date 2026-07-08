@@ -10,9 +10,11 @@ Requisitos (ver requirements.txt):
 """
 
 import os
+import re
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 
 import asyncssh
 from dotenv import load_dotenv
@@ -76,6 +78,16 @@ SERVICES_TO_WATCH = {
     "mysql": os.getenv("SERVICE_MYSQL", "mysql"),
     "ftp": os.getenv("SERVICE_FTP", "vsftpd"),
 }
+
+# ------------------------------------------------------------------
+# ESTADO GLOBAL: notificaciones on/off + historial de errores
+# ------------------------------------------------------------------
+
+_notifications_enabled = True
+
+# Cada entrada: {"time": datetime, "server": str, "host": str, "service": str, "status": str}
+_error_history: list[dict] = []
+MAX_HISTORY = 200  # tope para no crecer infinito en memoria
 
 # ------------------------------------------------------------------
 # CONEXIÓN SSH Y EJECUCIÓN DE COMANDOS
@@ -166,6 +178,7 @@ async def cmd_ver_cpu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def help_text(mention: str = "") -> str:
     saludo = f"👋 ¡Bienvenido/a {mention}!\n\n" if mention else ""
+    estado_notif = "🔔 activadas" if _notifications_enabled else "🔕 desactivadas"
     return (
         f"{saludo}"
         "🤖 *Bot NOC — Monitoreo y comandos remotos*\n\n"
@@ -179,8 +192,13 @@ def help_text(mention: str = "") -> str:
         "• `ver memoria` — uso de RAM\n"
         "• `ver usuario` — usuarios conectados\n"
         "• `ver cpu` — uso de CPU\n\n"
-        "Todas las respuestas incluyen datos de *ambos* servidores.\n"
-        "El bot también avisa automáticamente si algún servicio se cae o se recupera.\n\n"
+        "*Alertas automáticas:*\n"
+        "• `notifications off` — silencia las alertas de caídas\n"
+        "• `notifications on` — vuelve a activarlas\n"
+        f"• Estado actual: {estado_notif}\n\n"
+        "*Historial:*\n"
+        "• `history error N` — últimos N errores registrados (del más reciente al más antiguo)\n\n"
+        "Todas las respuestas incluyen datos de *ambos* servidores.\n\n"
         "Escribe `info` en cualquier momento para volver a ver esta lista."
     )
 
@@ -198,7 +216,42 @@ async def on_new_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(help_text(mention=mention), parse_mode="Markdown")
 
 
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE, turn_on: bool):
+    global _notifications_enabled
+    _notifications_enabled = turn_on
+    if turn_on:
+        await update.message.reply_text("🔔 Notificaciones de caídas de servicio *activadas*.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(
+            "🔕 Notificaciones de caídas de servicio *desactivadas*.\n"
+            "El bot sigue monitoreando y guardando el historial, solo no va a mandar avisos hasta que actives con `notifications on`.",
+            parse_mode="Markdown",
+        )
+
+
+async def cmd_history_error(update: Update, context: ContextTypes.DEFAULT_TYPE, n: int):
+    if n <= 0:
+        await update.message.reply_text("Pon un número mayor a 0, ej: `history error 3`", parse_mode="Markdown")
+        return
+
+    if not _error_history:
+        await update.message.reply_text("📭 Todavía no hay errores registrados.")
+        return
+
+    # del más reciente al más antiguo
+    ultimos = list(reversed(_error_history))[:n]
+
+    lines = [f"📜 *Últimos {len(ultimos)} error(es) registrados:*", ""]
+    for i, e in enumerate(ultimos, start=1):
+        ts = e["time"].strftime("%d/%m/%Y %H:%M:%S")
+        lines.append(
+            f"{i}. 🚨 *{e['server']}* ({e['host']}) — `{e['service']}` → `{e['status']}`\n   🕒 {ts}"
+        )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+
     text = (update.message.text or "").strip().lower()
 
     if text == "estado servicio apache2":
@@ -217,6 +270,13 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_ver_cpu(update, context)
     elif text == "info":
         await cmd_info(update, context)
+    elif text == "notifications off":
+        await cmd_notifications(update, context, turn_on=False)
+    elif text == "notifications on":
+        await cmd_notifications(update, context, turn_on=True)
+    elif re.fullmatch(r"history error \d+", text):
+        n = int(text.split()[-1])
+        await cmd_history_error(update, context, n)
 
 
 async def cmd_getid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -249,27 +309,40 @@ async def monitor_loop(app: Application):
                     previous = _last_state.get(key)
 
                     if previous is not None and previous == "active" and current != "active":
-                        msg = (
-                            f"🚨 *ALERTA: servicio caído*\n"
-                            f"🖥️ Servidor: *{server.name}* ({server.host})\n"
-                            f"⚙️ Servicio: `{service_name}`\n"
-                            f"Estado actual: `{current}`"
-                        )
-                        try:
-                            await app.bot.send_message(chat_id=GROUP_CHAT_ID, text=msg, parse_mode="Markdown")
-                        except Exception as e:
-                            log.error(f"No se pudo enviar alerta: {e}")
+                        # El historial se guarda SIEMPRE, esté prendida o apagada la notificación
+                        _error_history.append({
+                            "time": datetime.now(),
+                            "server": server.name,
+                            "host": server.host,
+                            "service": service_name,
+                            "status": current,
+                        })
+                        if len(_error_history) > MAX_HISTORY:
+                            del _error_history[0]
+
+                        if _notifications_enabled:
+                            msg = (
+                                f"🚨 *ALERTA: servicio caído*\n"
+                                f"🖥️ Servidor: *{server.name}* ({server.host})\n"
+                                f"⚙️ Servicio: `{service_name}`\n"
+                                f"Estado actual: `{current}`"
+                            )
+                            try:
+                                await app.bot.send_message(chat_id=GROUP_CHAT_ID, text=msg, parse_mode="Markdown")
+                            except Exception as e:
+                                log.error(f"No se pudo enviar alerta: {e}")
 
                     if previous is not None and previous != "active" and current == "active":
-                        msg = (
-                            f"✅ *Servicio recuperado*\n"
-                            f"🖥️ Servidor: *{server.name}* ({server.host})\n"
-                            f"⚙️ Servicio: `{service_name}` está `active` de nuevo"
-                        )
-                        try:
-                            await app.bot.send_message(chat_id=GROUP_CHAT_ID, text=msg, parse_mode="Markdown")
-                        except Exception as e:
-                            log.error(f"No se pudo enviar alerta: {e}")
+                        if _notifications_enabled:
+                            msg = (
+                                f"✅ *Servicio recuperado*\n"
+                                f"🖥️ Servidor: *{server.name}* ({server.host})\n"
+                                f"⚙️ Servicio: `{service_name}` está `active` de nuevo"
+                            )
+                            try:
+                                await app.bot.send_message(chat_id=GROUP_CHAT_ID, text=msg, parse_mode="Markdown")
+                            except Exception as e:
+                                log.error(f"No se pudo enviar alerta: {e}")
 
                     _last_state[key] = current
         except Exception as e:
