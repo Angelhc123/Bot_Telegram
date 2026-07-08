@@ -250,8 +250,7 @@ async def cmd_history_error(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-
-
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip().lower()
 
     if text == "estado servicio apache2":
